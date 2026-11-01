@@ -1,4 +1,8 @@
 #include "PairProbe.hpp"
+#include "BikeBodyMap.hpp"
+#include "LiveProbe.hpp"
+#include "NativeProbe.hpp"
+#include "FadeContacts.hpp"
 #include "VerifiedBuild.hpp"
 #include "VehicleQueries.hpp"
 #include "VehicleLifecycle.hpp"
@@ -34,13 +38,14 @@ std::array<Record,512> matches;
 std::array<std::atomic<uint32_t>,8> mountSamples{};
 std::atomic<uint64_t> mounted{0xffffffff};
 std::atomic<uint64_t> publishedEpoch{1}, ghostedContacts{0};
+std::atomic<uint64_t> contactFreeMount{UINT64_MAX}, contactFreePairs{0};
 uint32_t nextMount=0; // Running callback only.
 bool ownerReaderReady=false;
 Dnc::VehicleLifecycle<> lifecycle(1500); // milliseconds; diagnostic only
 Dnc::TrySnapshot<Dnc::VehicleLifecycle<>> published(lifecycle);
 std::atomic<uint64_t> candidates{0}, snapshotBusy{0}, driverDenied{0};
 Dnc::DriverGate driverGate;
-struct Discovery { uint64_t mount{}; uint32_t first{},second{}; };
+struct Discovery { uint64_t mount{}; uint32_t first{},second{}; bool ordinary{},known{},ghosted{}; };
 Dnc::TryQueue<Discovery,512> discovery;
 std::atomic<uint64_t> queued{0}, queueDrops{0}, missingOwners{0}, ruleRejected{0};
 uint64_t resolvedOwners=0, unresolvedOwners=0, refreshCalls=0, publishOk=0, publishSkipped=0;
@@ -48,6 +53,12 @@ size_t replaceCursor=0;
 std::array<uint64_t,256> retryAt{};
 std::array<unsigned,256> failures{};
 std::vector<uint32_t> knownProxies; // Running callback only; capped at 256.
+std::atomic<uint64_t> activeBike{UINT64_MAX},extraPairs{0},characterPairs{0};
+uint64_t bikeEntity{},riderEntity{}; // game thread only
+Dnc::BikeBodyMap aliases;
+Dnc::TrySnapshot<Dnc::BikeBodyMap> bikeBodies(aliases);
+struct BodyRequest {uint64_t mount;uint32_t proxy;};
+Dnc::TryQueue<BodyRequest,512> bodyRequests;
 uint64_t NowMs() {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -67,22 +78,32 @@ uint16_t* OnPair(void* self,uint16_t* result,uint32_t pair,uint32_t attr0,const 
     const auto observation=mounted.load(std::memory_order_relaxed);
     const auto player=static_cast<uint32_t>(observation);
     const auto bank=static_cast<uint32_t>(observation>>32);
+    Dnc::BikeBodyBinding extra0{},extra1{};
+    const bool riding=activeBike.load(std::memory_order_acquire)==observation && player!=0xffffffff;
+    if(riding && (attr0==1 || attr0==0x11) && (attr1==1 || attr1==0x11)) {
+        const auto tick=NowMs();
+        bikeBodies.Read([&](const auto& map){extra0=map.Lookup(observation,id0,tick);extra1=map.Lookup(observation,id1,tick);});
+        if(!extra0.vehicle.Valid() && id0!=player) bodyRequests.Push({observation,id0});
+        if(!extra1.vehicle.Valid() && id1!=player) bodyRequests.Push({observation,id1});
+    }
+    const auto canonical0=extra0.vehicle.Valid()?extra0.vehicle.proxy:id0;
+    const auto canonical1=extra1.vehicle.Valid()?extra1.vehicle.proxy:id1;
     bool trackingCandidate=false;
-    Dnc::VehicleIdentity authorizedDriver{};
+    Dnc::VehicleIdentity authorizedDriver{},authorizedTraffic{};
     uint64_t decisionEpoch=0;
-    if(player!=0xffffffff && (id0==player || id1==player)) {
-        if(discovery.Push({observation,id0,id1})) queued.fetch_add(1,std::memory_order_relaxed);
-        else queueDrops.fetch_add(1,std::memory_order_relaxed);
+    if(player!=0xffffffff && (canonical0==player || canonical1==player)) {
         const auto now=NowMs();
         if(!published.Read([&](const auto& state) {
-            const auto a=state.IdentityForProxy(id0,now), b=state.IdentityForProxy(id1,now);
+            const auto a=state.IdentityForProxy(canonical0,now), b=state.IdentityForProxy(canonical1,now);
             if(!a.Valid() || !b.Valid()) { missingOwners.fetch_add(1,std::memory_order_relaxed); return; }
+            if((extra0.vehicle.Valid() && extra0.vehicle!=a) || (extra1.vehicle.Valid() && extra1.vehicle!=b)) return;
             const auto driverIdentity=a.proxy==player ? a : b;
             if(!driverGate.Allows(driverIdentity,observation,now)) { driverDenied.fetch_add(1,std::memory_order_relaxed); return; }
             if(state.Assess(state.Epoch(),a,b,now)==Dnc::PairAssessment::TrafficCandidate)
                 {
                     candidates.fetch_add(1,std::memory_order_relaxed); trackingCandidate=true;
                     authorizedDriver=driverIdentity;
+                    authorizedTraffic=a.proxy==player ? b : a;
                     decisionEpoch=state.Epoch();
                 }
             else ruleRejected.fetch_add(1,std::memory_order_relaxed);
@@ -108,15 +129,28 @@ uint16_t* OnPair(void* self,uint16_t* result,uint32_t pair,uint32_t attr0,const 
     if (matchSequence<matches.size()) save(matches[static_cast<size_t>(matchSequence)]);
     // Write to this invocation's shape pair only. PhysX owns its lifetime and
     // runs filtering again for a new pair. Never retain a pair ID for mutation.
-    if (trackingCandidate && result && returned==result && pairFlags && *pairFlags==0x3e61 &&
+    const bool ordinary=attr0==1 && attr1==1 && result && returned==result && *result==0 && pairFlags && Dnc::SupportedDrivingContact(*pairFlags);
+    bool ghosted=false;
+    if (trackingCandidate && result && returned==result && pairFlags && Dnc::SupportedDrivingContact(*pairFlags) &&
         actor0 && actor1 && shape0 && shape1 && mounted.load(std::memory_order_acquire)==observation &&
         publishedEpoch.load(std::memory_order_acquire)==decisionEpoch &&
         driverGate.Allows(authorizedDriver,observation,NowMs())) {
-        const auto decision=Dnc::PlanNewTrafficContact(*result,*pairFlags,attr0,attr1);
+        const bool full=contactFreeMount.load(std::memory_order_acquire)==observation;
+        const auto decision=Dnc::PlanDrivingPair(*result,*pairFlags,Dnc::DrivingAttribute(attr0,extra0),Dnc::DrivingAttribute(attr1,extra1),full);
         if (decision.changed) {
             *pairFlags=decision.pairFlags;
+            *result=decision.filterFlags;
+            if(full) ++contactFreePairs;
+            if(extra0.vehicle.Valid() || extra1.vehicle.Valid()) ++extraPairs;
+            if(extra0.character || extra1.character) ++characterPairs;
+            ghosted=true;
+            QueueFadeContact({observation,authorizedDriver,authorizedTraffic,NowMs()});
             ghostedContacts.fetch_add(1,std::memory_order_relaxed);
         }
+    }
+    if(playerMatch) {
+        if(discovery.Push({observation,id0,id1,ordinary,trackingCandidate,ghosted})) ++queued;
+        else ++queueDrops;
     }
     return returned;
 }
@@ -144,10 +178,22 @@ void ObservePlayerProxy(uint32_t proxy) {
     if (proxy==0xffffffff) mounted.store(0xffffffff,std::memory_order_relaxed);
     else mounted.store((uint64_t(nextMount++)<<32)|proxy,std::memory_order_relaxed);
 }
-void ObserveDriver(uint64_t entity,uint32_t proxy,int verifiedDriver) {
-    const auto observation=mounted.load(std::memory_order_relaxed);
+void ObserveNearbyVehicle(uint64_t entity,uint32_t proxy,int owned,int traffic,int driver) {
+    if(!ownerReaderReady || !entity || proxy==0xffffffff || proxy==static_cast<uint32_t>(mounted.load())) return;
+    lifecycle.Update(lifecycle.Epoch(),{{entity,proxy},Dnc::Fact::Yes,FactOf(owned),FactOf(traffic),FactOf(driver)},NowMs());
+}
+void ObserveDriver(uint64_t entity,uint32_t proxy,int verifiedDriver,int owned,bool bike,uint64_t rider) {
+    const auto observation=mounted.load(std::memory_order_acquire);
     if(proxy==0xffffffff || static_cast<uint32_t>(observation)!=proxy) { driverGate.Revoke(); return; }
-    driverGate.Observe({entity,proxy},observation,FactOf(verifiedDriver),NowMs());
+    const auto now=NowMs();
+    const Dnc::VehicleIdentity id{entity,proxy};
+    driverGate.Observe(id,observation,FactOf(verifiedDriver),now);
+    bikeEntity=entity;riderEntity=rider;
+    activeBike.store(verifiedDriver==1 && bike ? observation : UINT64_MAX,std::memory_order_release);
+    contactFreeMount.store(verifiedDriver==1 && (bike || owned==0) ? observation : UINT64_MAX,std::memory_order_release);
+    lifecycle.Update(lifecycle.Epoch(),{id,Dnc::Fact::Yes,FactOf(owned),Dnc::Fact::Unknown,FactOf(verifiedDriver)},now);
+    lifecycle.SetDriver(lifecycle.Epoch(),id,FactOf(verifiedDriver),now);
+    PublishNearbyObservations();
 }
 void StartPairProbe(RED4ext::v1::PluginHandle h,const RED4ext::v1::Sdk* sdk) {
     const auto* base=reinterpret_cast<const unsigned char*>(GetModuleHandleW(nullptr));
@@ -171,11 +217,13 @@ void StartPairProbe(RED4ext::v1::PluginHandle h,const RED4ext::v1::Sdk* sdk) {
     ownerReaderReady=std::memcmp(base+DncBuild::ProxyOwnerRva,DncBuild::ProxyOwnerBytes.data(),DncBuild::ProxyOwnerBytes.size())==0 &&
         std::memcmp(base+DncBuild::ResolveSharedProxyRva,DncBuild::ResolveSharedProxyBytes.data(),DncBuild::ResolveSharedProxyBytes.size())==0;
     sdk->logger->InfoF(h,"DNC_OWNER_READER ready=%u",unsigned(ownerReaderReady));
-    sdk->logger->Info(h,"DNC_GHOST_READY mode=creationOnly originalFlags=3e61 suppressedFlags=3e60");
+    sdk->logger->Info(h,"DNC_GHOST_READY mode=creationOnly detectedDynamicPairs=1");
 }
 namespace {
 bool LogProxyOwner(uint32_t proxy,RED4ext::v1::PluginHandle h,const RED4ext::v1::Sdk* sdk,bool log=true) {
     if (!ownerReaderReady) return false;
+    // The mounted entity and its seat are refreshed directly by PollLiveVehicle.
+    if(proxy==static_cast<uint32_t>(mounted.load())) return true;
     bool ownerResolved=false;
     ++refreshCalls;
     const auto* base=reinterpret_cast<const unsigned char*>(GetModuleHandleW(nullptr));
@@ -207,6 +255,9 @@ bool LogProxyOwner(uint32_t proxy,RED4ext::v1::PluginHandle h,const RED4ext::v1:
             const auto attached=static_cast<RED4ext::ent::Entity*>(owner.GetPtr())->status==RED4ext::EntityStatus::Attached;
             const Dnc::VehicleIdentity identity{id,proxy};
             if(attached) {
+                if(vehicle && traffic==1 && playerVehicle==0) {
+                    InspectFadeTarget(identity,static_cast<RED4ext::ent::Entity*>(owner.GetPtr()),h,sdk);
+                }
                 const int driver=vehicle ? ReadVehicleBool(owner.GetPtr(),"IsPlayerDriver") : -1;
                 lifecycle.Update(lifecycle.Epoch(),{identity,vehicle ? Dnc::Fact::Yes : Dnc::Fact::No,
                     FactOf(playerVehicle),FactOf(traffic),FactOf(driver)},now);
@@ -240,7 +291,51 @@ void ObserveNearbyProxy(uint32_t proxy,RED4ext::v1::PluginHandle h,const RED4ext
     sdk->logger->InfoF(h,"DNC_DISCOVERED proxy=%08x source=%s",proxy,nearby ? "nearby-query" : "contact");
     LogProxyOwner(proxy,h,sdk);
 }
+void PublishNearbyObservations() {
+    if(published.Publish(lifecycle)) ++publishOk; else ++publishSkipped;
+}
+namespace {
+Dnc::BikeBodyBinding ResolveBody(uint32_t raw,uint64_t now) {
+    using namespace RED4ext;
+    using GetOwner=void*(*)(WeakHandle<IScriptable>*,uint32_t,uint32_t);
+    auto fn=reinterpret_cast<GetOwner>(reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr))+DncBuild::ProxyOwnerRva);
+    WeakHandle<IScriptable> weak;fn(&weak,raw,0);auto owner=weak.Lock();
+    auto* rtti=CRTTISystem::Get();auto* entityType=rtti->GetClass("entEntity");auto* vehicle=rtti->GetClass("vehicleBaseObject");auto* character=rtti->GetClass("ScriptedPuppet");auto* chassis=rtti->GetClass("vehicleChassisComponent");
+    if(!owner || !entityType || !vehicle || !chassis || !owner->GetType()->IsA(entityType)) return {};
+    auto* entity=static_cast<ent::Entity*>(owner.GetPtr());if(entity->status!=EntityStatus::Attached) return {};
+    const bool puppet=character && owner->GetType()->IsA(character);
+    if(entity->entityID.hash==bikeEntity || (puppet && entity->entityID.hash==riderEntity))
+        return {raw,{bikeEntity,static_cast<uint32_t>(activeBike.load())},now+300,puppet};
+    if(puppet) {owner=TrafficOccupantMount(owner);if(!owner) return {};}
+    if(!owner->GetType()->IsA(vehicle) || ReadVehicleBool(owner.GetPtr(),"IsPlayerVehicle")!=0 || ReadVehicleBool(owner.GetPtr(),"HasTrafficSlot")!=1) return {};
+    entity=static_cast<ent::Entity*>(owner.GetPtr());if(entity->status!=EntityStatus::Attached || entity->components.size()>512) return {};
+    for(const auto& c:entity->components) if(c && c->GetType()->IsA(chassis)) {
+        uint32_t proxy=0xffffffff;if(!ReadVerifiedChassisProxy(c.GetPtr(),proxy) || proxy==raw) return {};
+        return {raw,{entity->entityID.hash,proxy},now+300,puppet};
+    }
+    return {};
+}
+void RefreshBikeBodies() {
+    const auto mount=activeBike.load();const auto now=NowMs();
+    static std::array<BodyRequest,128> recent{};static size_t cursor=0;
+    if(mount!=aliases.mount){aliases={};aliases.mount=mount;recent={};bikeBodies.Publish(aliases);}
+    if(!ownerReaderReady || mount==UINT64_MAX || mount!=mounted.load()) return;
+    static uint64_t checkAt=0;if(now<checkAt) return;checkAt=now+25;
+    for(auto& binding:aliases.entries) if(binding.vehicle.Valid() && binding.expires<=now+100) binding=ResolveBody(binding.raw,now);
+    BodyRequest request{};unsigned resolved=0;
+    for(unsigned i=0;i<96 && resolved<12 && bodyRequests.Pop(request);++i) {
+        if(request.mount!=mount || !request.proxy || request.proxy==0xffffffff || aliases.Lookup(mount,request.proxy,now).vehicle.Valid()) continue;
+        if(std::any_of(recent.begin(),recent.end(),[&](const auto& old){return old.proxy==request.proxy && old.mount>now;})) continue;
+        recent[cursor++%recent.size()]={now+200,request.proxy};++resolved;
+        const auto body=ResolveBody(request.proxy,now);if(!body.vehicle.Valid()) continue;
+        for(auto& slot:aliases.entries) if(!slot.vehicle.Valid()){slot=body;break;}
+    }
+    bikeBodies.Publish(aliases);
+}
+}
 void DrainPairProbe(RED4ext::v1::PluginHandle h,const RED4ext::v1::Sdk* sdk) {
+    RefreshBikeBodies();
+    UpdateFadeContacts(mounted.load(std::memory_order_acquire),NowMs(),h,sdk);
     const auto drain=[&](auto& records,const char* kind) {
         for (auto& r:records) {
             if (r.logged || !r.ready.load(std::memory_order_acquire)) continue;
@@ -254,6 +349,15 @@ void DrainPairProbe(RED4ext::v1::PluginHandle h,const RED4ext::v1::Sdk* sdk) {
     Discovery item;
     for(unsigned i=0;ownerReaderReady && i<128 && discovery.Pop(item);++i) {
         if(item.mount!=mounted.load(std::memory_order_relaxed)) continue;
+        static uint64_t auditMount=0;
+        static std::array<uint32_t,256> audited{};
+        static size_t used=0;
+        if(auditMount!=item.mount){auditMount=item.mount;used=0;}
+        const auto other=item.first==static_cast<uint32_t>(item.mount) ? item.second : item.first;
+        if(item.ordinary && used<audited.size() && std::find(audited.begin(),audited.begin()+used,other)==audited.begin()+used) {
+            audited[used++]=other;
+            sdk->logger->InfoF(h,"DNC_FIRST_CONTACT proxy=%08x classifiedTraffic=%u suppressed=%u",other,unsigned(item.known),unsigned(item.ghosted));
+        }
         for(const auto proxy:{item.first,item.second}) {
             ObserveNearbyProxy(proxy,h,sdk,false);
         }
@@ -299,8 +403,10 @@ bool StopPairProbe(RED4ext::v1::PluginHandle h,const RED4ext::v1::Sdk* sdk) {
     }
     if (target) sdk->logger->Info(h,"DNC_PAIR_DETACHED");
     target=nullptr;
-    sdk->logger->InfoF(h,"DNC_GHOST_END contacts=%llu",static_cast<unsigned long long>(ghostedContacts.load()));
+    sdk->logger->InfoF(h,"DNC_GHOST_END contacts=%llu contactFree=%llu",static_cast<unsigned long long>(ghostedContacts.load()),static_cast<unsigned long long>(contactFreePairs.load()));
+    sdk->logger->InfoF(h,"DNC_BIKE_BODIES extraPairs=%llu characterPairs=%llu",static_cast<unsigned long long>(extraPairs.load()),static_cast<unsigned long long>(characterPairs.load()));
     ownerReaderReady=false; // Do not resolve entities during shutdown.
     DrainPairProbe(h,sdk);
     return true;
 }
+

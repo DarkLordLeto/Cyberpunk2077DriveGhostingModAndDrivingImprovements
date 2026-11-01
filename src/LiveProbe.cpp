@@ -42,7 +42,7 @@ bool CallHandle(CBaseFunction* f, StackArgs_t& args, Handle<IScriptable>& result
     if (ret.starts_with("handle:")) return ExecuteGlobalFunction(f->fullName, &result, args);
     return false;
 }
-void ProbeNearby(IScriptable* context,v1::PluginHandle h,const v1::Sdk* sdk) {
+void ProbeNearby(IScriptable* context,float radius,v1::PluginHandle h,const v1::Sdk* sdk) {
     static bool checked=false;
     static CBaseFunction* query=nullptr;
     auto* rtti=CRTTISystem::Get();
@@ -54,11 +54,10 @@ void ProbeNearby(IScriptable* context,v1::PluginHandle h,const v1::Sdk* sdk) {
             TypeName(query->params[0])!="Float" || TypeName(query->params[1])!="gameTargetSearchFilter" ||
             !query->params[1]->flags.isOptional || TypeName(query->returnType)!="array:handle:entEntity" ||
             query->returnType->type->GetSize()!=sizeof(DynArray<Handle<ent::Entity>>)) query=nullptr;
-        sdk->logger->InfoF(h,"DNC_NEARBY_READY ready=%u radius=60 defaultFilter=1",unsigned(query!=nullptr));
+        sdk->logger->InfoF(h,"DNC_NEARBY_READY ready=%u nearRadius=18 farRadius=60 defaultFilter=1",unsigned(query!=nullptr));
     }
     if(!query || !context || !context->GetType()->IsA(gameObject)) return;
     const auto queryStart=std::chrono::steady_clock::now();
-    float radius=60.0f;
     StackArgs_t args;
     args.emplace_back(query->params[0]->type,&radius);
     DynArray<Handle<ent::Entity>> found;
@@ -78,13 +77,17 @@ void ProbeNearby(IScriptable* context,v1::PluginHandle h,const v1::Sdk* sdk) {
             if(!component || !component->GetType()->IsA(chassisType)) continue;
             uint32_t proxy=0xffffffff;
             if(ReadVerifiedChassisProxy(component.GetPtr(),proxy)) {
-                ObserveNearbyProxy(proxy,h,sdk);++proxies;
+                ObserveNearbyProxy(proxy,h,sdk);
+                ObserveNearbyVehicle(entity->entityID.hash,proxy,ReadVehicleBool(entity.GetPtr(),"IsPlayerVehicle"),
+                    ReadVehicleBool(entity.GetPtr(),"HasTrafficSlot"),ReadVehicleBool(entity.GetPtr(),"IsPlayerDriver"));
+                ++proxies;
             }
             break;
         }
     }
-    sdk->logger->InfoF(h,"DNC_NEARBY_RESULT returned=%u inspected=%u vehicles=%u proxies=%u truncated=%u elapsedUs=%llu",
-        unsigned(found.size()),unsigned(inspected),vehicles,proxies,unsigned(found.size()>inspected),static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-queryStart).count()));
+    PublishNearbyObservations();
+    sdk->logger->InfoF(h,"DNC_NEARBY_RESULT returned=%u inspected=%u vehicles=%u proxies=%u truncated=%u elapsedUs=%llu radius=%.0f",
+        unsigned(found.size()),unsigned(inspected),vehicles,proxies,unsigned(found.size()>inspected),static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-queryStart).count()),static_cast<double>(radius));
 }
 void LogResource(const Ref<physics::SystemResource>& ref, const char* label,
                  v1::PluginHandle h, const v1::Sdk* sdk) {
@@ -117,6 +120,19 @@ void LogResource(const Ref<physics::SystemResource>& ref, const char* label,
         ++bodyIndex;
     }
 }
+}
+
+RED4ext::Handle<RED4ext::IScriptable> TrafficOccupantMount(RED4ext::Handle<RED4ext::IScriptable>& puppet) {
+    using namespace RED4ext;
+    static auto* f=FindGlobal("GetMountedVehicle");
+    Handle<IScriptable> result;
+    if(!f || f->params.size()!=1 || !puppet || (TypeName(f->returnType)!="whandle:vehicleBaseObject" && TypeName(f->returnType)!="handle:vehicleBaseObject")) return result;
+    const auto arg=TypeName(f->params[0]);
+    if(arg!="handle:gameObject" && arg!="whandle:gameObject") return result;
+    WeakHandle<IScriptable> weak(puppet);StackArgs_t args;
+    args.emplace_back(f->params[0]->type,arg=="whandle:gameObject" ? static_cast<void*>(&weak) : static_cast<void*>(&puppet));
+    if(!CallHandle(f,args,result)) result.Reset();
+    return result;
 }
 
 void PollLiveVehicle(RED4ext::v1::PluginHandle h, const RED4ext::v1::Sdk* sdk) {
@@ -223,12 +239,20 @@ void PollLiveVehicle(RED4ext::v1::PluginHandle h, const RED4ext::v1::Sdk* sdk) {
         }
     }
     ObservePlayerProxy(currentProxy);
-    ObserveDriver(entity->entityID.hash,currentProxy,driver);
+    auto* bikeType=rtti->GetClass("vehicleBikeBaseObject");
+    ObserveDriver(entity->entityID.hash,currentProxy,driver,ReadVehicleBool(vehicle.GetPtr(),"IsPlayerVehicle"),bikeType && vehicle->GetType()->IsA(bikeType),static_cast<ent::Entity*>(player.GetPtr())->entityID.hash);
     status("vehicle-attached");
     static auto nextNearby=Clock::time_point{};
-    if(Clock::now()>=nextNearby) {
-        nextNearby=Clock::now()+std::chrono::milliseconds(500);
-        ProbeNearby(player.GetPtr(),h,sdk);
+    static unsigned scan=0;
+    if(driver==1 && currentProxy!=0xffffffff && (lastVehicle!=entity->entityID.hash || Clock::now()>=nextNearby)) {
+        const bool newMount=lastVehicle!=entity->entityID.hash;
+        if(newMount) scan=0;
+        nextNearby=Clock::now()+std::chrono::milliseconds(150);
+        // Dense traffic can fill the broad query with unrelated entities. Query
+        // the immediate approach twice for every longer-range look ahead.
+        const float radius=(scan++%3==2) ? 60.0f : 18.0f;
+        ObserveNearbyProxy(currentProxy,h,sdk);
+        ProbeNearby(player.GetPtr(),radius,h,sdk);
     }
     if (lastVehicle == entity->entityID.hash) return;
     lastVehicle = entity->entityID.hash;

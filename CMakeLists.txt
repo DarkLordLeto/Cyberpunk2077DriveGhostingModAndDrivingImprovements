@@ -1,10 +1,10 @@
 cmake_minimum_required(VERSION 3.21)
-project(DriveNoCollision VERSION 0.22.0 LANGUAGES CXX)
+project(DriveNoCollision VERSION 0.29.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(RED4EXT_HEADER_ONLY ON CACHE BOOL "" FORCE)
 add_subdirectory(dependencies/RED4ext.SDK EXCLUDE_FROM_ALL)
-add_library(DriveNoCollision SHARED src/Main.cpp src/LiveProbe.cpp src/NativeProbe.cpp src/PairProbe.cpp src/PairTracking.cpp src/PhysicsPhaseProbe.cpp)
+add_library(DriveNoCollision SHARED src/Main.cpp src/LiveProbe.cpp src/NativeProbe.cpp src/PairProbe.cpp src/PairTracking.cpp src/PhysicsPhaseProbe.cpp src/FadeContacts.cpp src/GhostVisual.cpp)
 target_link_libraries(DriveNoCollision PRIVATE RED4ext::SDK)
 target_compile_definitions(DriveNoCollision PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_compile_options(DriveNoCollision PRIVATE /W4 /EHsc)
@@ -127,4 +127,6 @@ if(BUILD_TESTING)
     target_compile_options(SimulationActorBoundsTests PRIVATE /W4 /EHsc)
     add_test(NAME SimulationActorBoundsTests COMMAND SimulationActorBoundsTests)
 endif()
+
+
 

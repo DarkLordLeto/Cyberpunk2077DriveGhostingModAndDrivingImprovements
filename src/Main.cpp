@@ -89,7 +89,7 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle handle,
         };
         if (!api->gameStates->Add(handle, RED4ext::EGameStateType::Running, &state)) return false;
         StartPairProbe(handle, sdk);
-        sdk->logger->Info(handle, "DNC_LOADED: traffic ghosting pilot 0.22.0; target patch 2.5");
+        sdk->logger->Info(handle, "DNC_LOADED: traffic ghosting and universal glass and bike bodies 0.29.0; target patch 2.5");
     } else if (reason == RED4ext::v1::EMainReason::Unload && sdk) {
         if (!StopPairProbe(handle, sdk)) return false;
         sdk->logger->Info(handle, "DNC_UNLOADED");
@@ -101,7 +101,7 @@ RED4EXT_C_EXPORT void RED4EXT_CALL Query(RED4ext::v1::PluginInfo* info)
 {
     info->name = L"DriveNoCollision";
     info->author = L"DriveNoCollision contributors";
-    info->version = RED4EXT_V1_SEMVER(0, 22, 0);
+    info->version = RED4EXT_V1_SEMVER(0, 29, 0);
     info->runtime = RED4EXT_V1_RUNTIME_VERSION_2_50;
     info->sdk = RED4EXT_V1_SDK_VERSION_CURRENT;
 }
@@ -110,6 +110,8 @@ RED4EXT_C_EXPORT uint32_t RED4EXT_CALL Supports()
 {
     return RED4EXT_API_VERSION_1;
 }
+
+
 
 
 
