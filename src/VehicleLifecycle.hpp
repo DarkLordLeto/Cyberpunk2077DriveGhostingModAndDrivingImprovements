@@ -16,6 +16,7 @@ struct VehicleObservation {
     Fact vehicle{}, playerOwned{}, traffic{}, playerDriver{};
     uint64_t observedAt{};
     bool present{};
+    bool verifiedTrafficOrigin{};
 };
 enum class PairAssessment { KeepOriginal, TrafficCandidate };
 
@@ -43,10 +44,14 @@ public:
     bool Update(uint64_t sourceEpoch,VehicleObservation value,uint64_t now) {
         if(sourceEpoch!=epoch || now<clock || !value.id.Valid()) return false;
         clock=now;
+        value.verifiedTrafficOrigin=value.vehicle==Fact::Yes && value.playerOwned==Fact::No && value.traffic==Fact::Yes;
         // Replace the entire observation, including unknown/negative facts.
         // Both entity-to-proxy changes and proxy-to-entity changes retire old mappings.
         for(auto& old:observations) {
             if(old.present && (old.id.entity==value.id.entity || old.id.proxy==value.id.proxy)) {
+                if(old.id==value.id && Fresh(old.observedAt,now) && old.verifiedTrafficOrigin &&
+                   value.vehicle==Fact::Yes && value.playerOwned==Fact::No && value.traffic==Fact::No)
+                    value.verifiedTrafficOrigin=true;
                 if(old.id==driver && !(old.id==value.id)) driver={};
                 old.present=false;
             }
@@ -84,14 +89,15 @@ public:
             if(item.present && item.id.proxy==proxy && Fresh(item.observedAt,now)) return item.id;
         return {};
     }
-    PairAssessment Assess(uint64_t sourceEpoch,VehicleIdentity a,VehicleIdentity b,uint64_t now) const {
+    PairAssessment Assess(uint64_t sourceEpoch,VehicleIdentity a,VehicleIdentity b,uint64_t now,bool continuingOverlap=false,bool retainTrafficOrigin=false) const {
         if(sourceEpoch!=epoch || !enabled || a==b || !driver.Valid() || !Fresh(driverAt,now))
             return PairAssessment::KeepOriginal;
         if(b==driver) { auto temp=a; a=b; b=temp; }
         if(!(a==driver)) return PairAssessment::KeepOriginal;
         const auto* player=Find(a,now); const auto* other=Find(b,now);
         if(!player || !other || player->vehicle!=Fact::Yes || player->playerDriver!=Fact::Yes ||
-           other->vehicle!=Fact::Yes || other->playerOwned!=Fact::No || other->traffic!=Fact::Yes)
+           other->vehicle!=Fact::Yes || other->playerOwned!=Fact::No ||
+           (other->traffic!=Fact::Yes && !((continuingOverlap || (retainTrafficOrigin && other->verifiedTrafficOrigin)) && other->traffic==Fact::No)))
             return PairAssessment::KeepOriginal;
         return PairAssessment::TrafficCandidate;
     }

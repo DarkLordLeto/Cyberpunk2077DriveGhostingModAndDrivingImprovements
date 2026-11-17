@@ -2,6 +2,7 @@
 #include "VehicleQueries.hpp"
 #include "LiveProbe.hpp"
 #include "NativeProbe.hpp"
+#include "UpdateProfile.hpp"
 #include <RED4ext/GameEngine.hpp>
 #include <RED4ext/Scripting/Natives/entEntity.hpp>
 #include <RED4ext/Scripting/Natives/Generated/vehicle/ChassisComponent.hpp>
@@ -14,6 +15,9 @@
 
 namespace {
 using namespace RED4ext;
+// Component, chassis and resource dump on each mount. Research output only;
+// it cost about 10 ms on the frame the player enters a vehicle.
+constexpr bool MountDiagnostics = false;
 std::string_view TypeName(const CProperty* p) {
     if (!p || !p->type) return {};
     const auto* name = p->type->GetName().ToString();
@@ -80,6 +84,7 @@ void ProbeNearby(IScriptable* context,float radius,v1::PluginHandle h,const v1::
                 ObserveNearbyProxy(proxy,h,sdk);
                 ObserveNearbyVehicle(entity->entityID.hash,proxy,ReadVehicleBool(entity.GetPtr(),"IsPlayerVehicle"),
                     ReadVehicleBool(entity.GetPtr(),"HasTrafficSlot"),ReadVehicleBool(entity.GetPtr(),"IsPlayerDriver"));
+                ObserveVehicleParts(entity.GetPtr(),proxy);
                 ++proxies;
             }
             break;
@@ -140,7 +145,9 @@ void PollLiveVehicle(RED4ext::v1::PluginHandle h, const RED4ext::v1::Sdk* sdk) {
     using Clock = std::chrono::steady_clock;
     static auto next = Clock::time_point{};
     if (Clock::now() < next) return;
-    next = Clock::now() + std::chrono::milliseconds(100);
+    // A stationary vehicle (entering, leaving, parked) is polled less often.
+    static bool parked = false;
+    next = Clock::now() + std::chrono::milliseconds(parked ? 250 : 100);
     static bool initialized = false, available = false;
     static CBaseFunction* getPlayer = nullptr;
     static CBaseFunction* getVehicle = nullptr;
@@ -203,7 +210,10 @@ void PollLiveVehicle(RED4ext::v1::PluginHandle h, const RED4ext::v1::Sdk* sdk) {
     StackArgs_t playerArgs;
     playerArgs.emplace_back(getPlayer->params[0]->type, &game);
     Handle<IScriptable> player;
-    if (!CallHandle(getPlayer, playerArgs, player)) { status("player-call-failed"); lastVehicle = 0; return; }
+    auto section = DncProfile::Now();
+    const bool playerCalled = CallHandle(getPlayer, playerArgs, player);
+    DncProfile::Add(DncProfile::GetPlayer, section);
+    if (!playerCalled) { status("player-call-failed"); lastVehicle = 0; return; }
     if (!player) { status("waiting-for-player"); lastVehicle = 0; return; }
     WeakHandle<IScriptable> weakPlayer(player);
     StackArgs_t vehicleArgs;
@@ -211,11 +221,15 @@ void PollLiveVehicle(RED4ext::v1::PluginHandle h, const RED4ext::v1::Sdk* sdk) {
         ? static_cast<void*>(&weakPlayer) : static_cast<void*>(&player);
     vehicleArgs.emplace_back(getVehicle->params[0]->type, arg);
     Handle<IScriptable> vehicle;
-    if (!CallHandle(getVehicle, vehicleArgs, vehicle)) { status("mounted-vehicle-call-failed"); lastVehicle = 0; return; }
+    section = DncProfile::Now();
+    const bool vehicleCalled = CallHandle(getVehicle, vehicleArgs, vehicle);
+    DncProfile::Add(DncProfile::GetVehicle, section);
+    if (!vehicleCalled) { status("mounted-vehicle-call-failed"); lastVehicle = 0; return; }
     if (!vehicle) {
         status("player-not-mounted");
         if (lastVehicle) sdk->logger->Info(h, "DNC_LIVE_UNMOUNTED");
         lastVehicle = 0;
+        parked = false; SetParkedMode(false);
         return;
     }
     auto* rtti = CRTTISystem::Get();
@@ -223,7 +237,9 @@ void PollLiveVehicle(RED4ext::v1::PluginHandle h, const RED4ext::v1::Sdk* sdk) {
     if (!vehicleType || !vehicle->GetType()->IsA(vehicleType)) { status("mounted-object-not-vehicle"); return; }
     auto* entity = static_cast<ent::Entity*>(vehicle.GetPtr());
     if (entity->status != EntityStatus::Attached || entity->components.size() > 512) { status("waiting-for-attached-vehicle"); return; }
+    section = DncProfile::Now();
     const int driver=ReadVehicleBool(vehicle.GetPtr(),"IsPlayerDriver");
+    DncProfile::Add(DncProfile::DriverFlag, section);
     static int previousDriver=-2;
     static uint64_t previousDriverVehicle=0;
     if (previousDriver!=driver || previousDriverVehicle!=entity->entityID.hash) {
@@ -232,33 +248,53 @@ void PollLiveVehicle(RED4ext::v1::PluginHandle h, const RED4ext::v1::Sdk* sdk) {
         previousDriver=driver;previousDriverVehicle=entity->entityID.hash;
     }
     uint32_t currentProxy=0xffffffff;
+    section = DncProfile::Now();
     auto* currentChassisType=rtti->GetClass("vehicleChassisComponent");
+    void* currentChassis=nullptr;
     for(const auto& component:entity->components) {
         if(component && currentChassisType && component->GetType()->IsA(currentChassisType)) {
-            ReadVerifiedChassisProxy(component.GetPtr(),currentProxy); break;
+            currentChassis=component.GetPtr();
+            ReadVerifiedChassisProxy(currentChassis,currentProxy); break;
         }
     }
+    // Parked means under 0.5 m/s for half a second on the same vehicle.
+    static auto movedAt=Clock::time_point{};
+    float speed=0.0f;
+    const bool still=currentChassis && ReadVerifiedChassisSpeed(currentChassis,speed) && speed<0.5f;
+    if(!still || lastVehicle!=entity->entityID.hash) movedAt=Clock::now();
+    parked=Clock::now()-movedAt>=std::chrono::milliseconds(500);
+    SetParkedMode(parked);
+    DncProfile::Add(DncProfile::ChassisRead, section);
     ObservePlayerProxy(currentProxy);
     auto* bikeType=rtti->GetClass("vehicleBikeBaseObject");
-    ObserveDriver(entity->entityID.hash,currentProxy,driver,ReadVehicleBool(vehicle.GetPtr(),"IsPlayerVehicle"),bikeType && vehicle->GetType()->IsA(bikeType),static_cast<ent::Entity*>(player.GetPtr())->entityID.hash);
+    section = DncProfile::Now();
+    const int ownedFlag=ReadVehicleBool(vehicle.GetPtr(),"IsPlayerVehicle");
+    DncProfile::Add(DncProfile::OwnedFlag, section);
+    section = DncProfile::Now();
+    ObserveDriver(entity->entityID.hash,currentProxy,driver,ownedFlag,bikeType && vehicle->GetType()->IsA(bikeType),static_cast<ent::Entity*>(player.GetPtr())->entityID.hash);
+    ObserveVehicleParts(vehicle.GetPtr(),currentProxy);
+    DncProfile::Add(DncProfile::DriverState, section);
     status("vehicle-attached");
     static auto nextNearby=Clock::time_point{};
     static unsigned scan=0;
     if(driver==1 && currentProxy!=0xffffffff && (lastVehicle!=entity->entityID.hash || Clock::now()>=nextNearby)) {
         const bool newMount=lastVehicle!=entity->entityID.hash;
         if(newMount) scan=0;
-        nextNearby=Clock::now()+std::chrono::milliseconds(150);
+        nextNearby=Clock::now()+std::chrono::milliseconds(parked ? 600 : 150);
         // Dense traffic can fill the broad query with unrelated entities. Query
         // the immediate approach twice for every longer-range look ahead.
         const float radius=(scan++%3==2) ? 60.0f : 18.0f;
+        section = DncProfile::Now();
         ObserveNearbyProxy(currentProxy,h,sdk);
         ProbeNearby(player.GetPtr(),radius,h,sdk);
+        DncProfile::Add(DncProfile::Nearby, section);
     }
     if (lastVehicle == entity->entityID.hash) return;
     lastVehicle = entity->entityID.hash;
     sdk->logger->InfoF(h, "DNC_LIVE_VEHICLE id=%llu class=%s appearance=%s components=%u",
         static_cast<unsigned long long>(lastVehicle), entity->GetType()->GetName().ToString(),
         entity->appearanceName.ToString(), unsigned(entity->components.size()));
+    if constexpr (!MountDiagnostics) return;
     auto* chassisType = rtti->GetClass("vehicleChassisComponent");
     for (const auto& component : entity->components) {
         if (!component) continue;

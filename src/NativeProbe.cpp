@@ -5,12 +5,13 @@
 #include "VerifiedBuild.hpp"
 #include <RED4ext/Scripting/Natives/Generated/Vector4.hpp>
 #include <cstring>
+#include <atomic>
 #include <cmath>
 #include <RED4ext/Scripting/Natives/Generated/physics/CollisionFilterResource.hpp>
 #include <RED4ext/Scripting/Natives/Generated/physics/StateValue.hpp>
 #include <RED4ext/Scripting/Natives/Generated/physics/SimulationFilter.hpp>
 namespace {
-bool CheckImage(const unsigned char* base) {
+bool VerifyImage(const unsigned char* base) {
     if (!base) return false;
     const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
     if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 || dos->e_lfanew > 4096) return false;
@@ -30,23 +31,30 @@ bool CheckImage(const unsigned char* base) {
         matches(DncBuild::PhysicalProxyReaderRva, DncBuild::PhysicalProxyReaderBytes) &&
         matches(DncBuild::OtherProxyReaderRva, DncBuild::OtherProxyReaderBytes);
 }
+// The executable image cannot change while the game runs, so the byte guards
+// are compared once per image base instead of on every read.
+bool CheckImage(const unsigned char* base) {
+    static std::atomic<const unsigned char*> verifiedBase{nullptr};
+    static std::atomic<bool> verified{false};
+    if (base && verifiedBase.load(std::memory_order_acquire)==base) return verified.load(std::memory_order_acquire);
+    const bool ok=VerifyImage(base);
+    if (base) { verified.store(ok,std::memory_order_release); verifiedBase.store(base,std::memory_order_release); }
+    return ok;
+}
 }
 namespace {
 bool Readable(const void* ptr, size_t size) {
     if (!ptr || !size) return false;
     auto current = reinterpret_cast<uintptr_t>(ptr);
     if (current > UINTPTR_MAX-size) return false;
-    const auto end=current+size;
-    while (current < end) {
-        MEMORY_BASIC_INFORMATION mbi{};
-        if (!VirtualQuery(reinterpret_cast<const void*>(current),&mbi,sizeof(mbi)) ||
-            mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS|PAGE_GUARD))) return false;
-        const auto protection=mbi.Protect & 0xff;
-        if (!(protection==PAGE_READONLY || protection==PAGE_READWRITE || protection==PAGE_WRITECOPY ||
-              protection==PAGE_EXECUTE_READ || protection==PAGE_EXECUTE_READWRITE || protection==PAGE_EXECUTE_WRITECOPY)) return false;
-        const auto next=reinterpret_cast<uintptr_t>(mbi.BaseAddress)+mbi.RegionSize;
-        if (next<=current) return false;
-        current=next;
+    // Copying through ReadProcessMemory fails cleanly on unreadable pages. The
+    // earlier VirtualQuery walk cost milliseconds per call on large heap regions.
+    unsigned char buffer[256];
+    while (size) {
+        const size_t chunk = size < sizeof(buffer) ? size : sizeof(buffer);
+        SIZE_T read = 0;
+        if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(current), buffer, chunk, &read) || read != chunk) return false;
+        current += chunk; size -= chunk;
     }
     return true;
 }
@@ -235,4 +243,15 @@ bool ReadVerifiedProxyBounds(uint32_t proxy,Dnc::WorldBounds& bounds,uint32_t& b
     Dnc::WorldBounds combined;
     if(!Dnc::CombineBodyBounds(count,std::span<const Dnc::BodyBoundsSample>(samples.data(),count),combined)) return false;
     bounds=combined;bodyCount=count;return true;
+}
+
+bool ReadVerifiedChassisSpeed(void* chassis,float& speed) {
+    const auto* base=reinterpret_cast<const unsigned char*>(GetModuleHandleW(nullptr));
+    if(!chassis || !CheckImage(base)) return false;
+    using GetVelocity=RED4ext::Vector4*(*)(void*,RED4ext::Vector4*);
+    alignas(16) RED4ext::Vector4 linear{};
+    reinterpret_cast<GetVelocity>(const_cast<unsigned char*>(base)+DncBuild::ChassisLinearVelocityRva)(chassis,&linear);
+    if(!(std::isfinite(linear.X) && std::isfinite(linear.Y) && std::isfinite(linear.Z))) return false;
+    speed=std::sqrt(linear.X*linear.X+linear.Y*linear.Y+linear.Z*linear.Z);
+    return true;
 }

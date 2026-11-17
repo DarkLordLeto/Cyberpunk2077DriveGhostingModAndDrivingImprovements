@@ -8,3 +8,6 @@ bool ReadVerifiedChassisProxy(void* chassis,uint32_t& proxy);
 bool ReadVerifiedWorldBounds(uint32_t proxy,Dnc::WorldBounds& bounds);
 
 bool ReadVerifiedProxyBounds(uint32_t proxy,Dnc::WorldBounds& bounds,uint32_t& bodyCount);
+
+// Linear speed in m/s through the guarded chassis velocity getter.
+bool ReadVerifiedChassisSpeed(void* chassis,float& speed);

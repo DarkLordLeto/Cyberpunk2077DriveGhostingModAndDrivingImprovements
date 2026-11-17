@@ -10,9 +10,8 @@ int main(){
     Check(!SupportedDrivingContact(1) && !SupportedDrivingContact(0x402) && !SupportedDrivingContact(0x403),"Unsupported contact admitted");
     for(auto name:{"body_player_02","bumper_f_unremovable_01","Door_FL","wheel_br_01","tire_fl_01","fuelcap_01"}) Check(GhostShellPart(name),"Exterior shell excluded");
     for(auto name:{"interior_01","seat_fl_01","steering_wheel","wheel_brake","door_fl_stickers","door_inner","window_f","body_shadow","chassis","engine","AppearanceProxyMesh"}) Check(!GhostShellPart(name),"Internal or accessory mesh exposed");
-    Check(PlanDrivingPair(0,0x3e61,1,1,true).filterFlags==2,"Borrowed/bike traffic contact still reported");
-    Check(PlanDrivingPair(0,0x3e61,1,1,false).filterFlags==0,"Owned car filter changed");
-    Check(!PlanDrivingPair(0,0x3e61,1,0,true).changed && !PlanDrivingPair(4,0x3e61,1,1,true).changed && !PlanDrivingPair(0,0x403,1,1,true).changed,"Protected pair suppressed");
+    Check(PlanDrivingPair(0,0x3e61,1,1).filterFlags==2,"Verified driving contact still reported");
+    Check(!PlanDrivingPair(0,0x3e61,1,0).changed && !PlanDrivingPair(4,0x3e61,1,1).changed && !PlanDrivingPair(0,0x403,1,1).changed,"Protected pair suppressed");
     BikeBodyMap bodies;bodies.mount=123;bodies.entries[0]={7,{11,8},100,true};
     Check(DrivingAttribute(0x11,bodies.Lookup(123,7,99))==1,"Verified mounted character rejected");
     Check(DrivingAttribute(0x11,bodies.Lookup(124,7,99))==0x11 && DrivingAttribute(0x11,bodies.Lookup(123,7,100))==0x11,"Expired or different mount authorized");

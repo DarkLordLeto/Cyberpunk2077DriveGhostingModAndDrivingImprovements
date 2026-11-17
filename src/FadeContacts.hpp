@@ -6,3 +6,4 @@ struct FadeContact {uint64_t mount; Dnc::VehicleIdentity driver,traffic; uint64_
 void QueueFadeContact(FadeContact contact);
 void UpdateFadeContacts(uint64_t mount,uint64_t now,RED4ext::v1::PluginHandle,const RED4ext::v1::Sdk*);
 void InspectFadeTarget(Dnc::VehicleIdentity,RED4ext::ent::Entity*,RED4ext::v1::PluginHandle,const RED4ext::v1::Sdk*);
+bool HasGhostOverlap(uint64_t mount,Dnc::VehicleIdentity driver,Dnc::VehicleIdentity traffic,uint64_t now);

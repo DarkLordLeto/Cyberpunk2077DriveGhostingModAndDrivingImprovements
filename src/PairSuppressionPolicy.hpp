@@ -21,12 +21,12 @@ inline bool SupportedDrivingContact(uint16_t flags) {
     constexpr uint16_t solve=0x1, modify=0x2, detect=0x400|0x800;
     return (flags&solve) && !(flags&modify) && (flags&detect);
 }
-inline PairDecision PlanDrivingPair(uint16_t filter,uint16_t pair,uint32_t attr0,uint32_t attr1,bool contactFree) {
+inline PairDecision PlanDrivingPair(uint16_t filter,uint16_t pair,uint32_t attr0,uint32_t attr1) {
     if(!SupportedDrivingContact(pair)) return {filter,pair,false};
     auto decision=PlanNewTrafficContact(filter,pair,attr0,attr1);
-    // For verified bike/borrowed-driver traffic only, eSUPPRESS prevents a
+    // For eligible driver/traffic pairs, eSUPPRESS prevents a
     // contact interaction (including reports) for this shape-pair lifetime.
-    if(decision.changed && contactFree) decision.filterFlags=2;
+    if(decision.changed) decision.filterFlags=2;
     return decision;
 }
 inline PairDecision PlanTrafficContact(uint16_t filter,uint16_t pair,uint32_t attr0,uint32_t attr1,

@@ -2,11 +2,17 @@
 #include <string_view>
 #include "LiveProbe.hpp"
 #include "PairProbe.hpp"
+#include "RaceTracking.hpp"
+#include "GpsRoute.hpp"
 #include <RED4ext/GameStates.hpp>
+#include <chrono>
+#include "UpdateProfile.hpp"
 
 namespace {
 RED4ext::v1::PluginHandle pluginHandle{};
 const RED4ext::v1::Sdk* sdk = nullptr;
+// The reflection dump was research output; it is no longer written at load.
+constexpr bool TypeDump = false;
 
 // Metadata inspection only. No game objects, functions or physics values are modified.
 void RED4EXT_CALL InspectTypes()
@@ -73,6 +79,8 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle handle,
         sdk = api;
         auto* rtti = RED4ext::CRTTISystem::Get();
         if (!rtti) return false;
+        RaceTracking::Register(handle, api);
+        GpsRoute::Register(handle, api);
         if (!api->gameStates) return false;
         RED4ext::v1::GameState state{};
         state.OnUpdate = [](RED4ext::CGameApplication*) -> bool {
@@ -80,16 +88,45 @@ RED4EXT_C_EXPORT bool RED4EXT_CALL Main(RED4ext::v1::PluginHandle handle,
             if (!inspected) {
                 inspected = true;
                 sdk->logger->Info(pluginHandle, "DNC_SCAN_PHASE Running");
-                InspectTypes();
+                if constexpr (TypeDump) InspectTypes();
             }
+            // Report frames where the plugin itself costs noticeable game-thread time.
+            using Clock = std::chrono::steady_clock;
+            const auto begin = Clock::now();
             PollLiveVehicle(pluginHandle, sdk);
+            const auto polled = Clock::now();
             DrainPairProbe(pluginHandle, sdk);
+            const auto done = Clock::now();
+            const auto pollUs = std::chrono::duration_cast<std::chrono::microseconds>(polled - begin).count();
+            const auto drainUs = std::chrono::duration_cast<std::chrono::microseconds>(done - polled).count();
+            // One summary line per second that contained a frame costing 2 ms or more.
+            static long long second = -1, maxPoll = 0, maxDrain = 0, totalUs = 0;
+            static unsigned slowFrames = 0, frames = 0, summaries = 0;
+            const auto current = std::chrono::duration_cast<std::chrono::seconds>(done.time_since_epoch()).count();
+            if (current != second) {
+                if (slowFrames && summaries < 3000) {
+                    ++summaries;
+                    sdk->logger->InfoF(pluginHandle, "DNC_SLOW_UPDATE frames=%u slowFrames=%u maxPollUs=%lld maxDrainUs=%lld totalUs=%lld",
+                        frames, slowFrames, maxPoll, maxDrain, totalUs);
+                    const auto& t = DncProfile::microseconds;
+                    sdk->logger->InfoF(pluginHandle, "DNC_UPDATE_SECTIONS getPlayer=%lld getVehicle=%lld driverFlag=%lld chassis=%lld ownedFlag=%lld driverState=%lld nearby=%lld audit=%lld bodies=%lld fade=%lld discovery=%lld ownerRefresh=%lld",
+                        t[DncProfile::GetPlayer], t[DncProfile::GetVehicle], t[DncProfile::DriverFlag], t[DncProfile::ChassisRead],
+                        t[DncProfile::OwnedFlag], t[DncProfile::DriverState], t[DncProfile::Nearby], t[DncProfile::Audit],
+                        t[DncProfile::Bodies], t[DncProfile::Fade], t[DncProfile::Discovery], t[DncProfile::OwnerRefresh]);
+                }
+                DncProfile::microseconds = {};
+                second = current; maxPoll = maxDrain = totalUs = 0; slowFrames = frames = 0;
+            }
+            ++frames; totalUs += pollUs + drainUs;
+            if (pollUs > maxPoll) maxPoll = pollUs;
+            if (drainUs > maxDrain) maxDrain = drainUs;
+            if (pollUs + drainUs >= 2000) ++slowFrames;
             // RED4ext 1.31 StateSystem::Run erases callbacks returning true.
             return false;
         };
         if (!api->gameStates->Add(handle, RED4ext::EGameStateType::Running, &state)) return false;
         StartPairProbe(handle, sdk);
-        sdk->logger->Info(handle, "DNC_LOADED: traffic ghosting and universal glass and bike bodies 0.29.0; target patch 2.5");
+        sdk->logger->Info(handle, "DNC_LOADED: traffic ghosting, universal glass, bike bodies and query pass-through, race tracking and GPS road routes 0.32.0; target patch 2.5");
     } else if (reason == RED4ext::v1::EMainReason::Unload && sdk) {
         if (!StopPairProbe(handle, sdk)) return false;
         sdk->logger->Info(handle, "DNC_UNLOADED");
@@ -101,7 +138,7 @@ RED4EXT_C_EXPORT void RED4EXT_CALL Query(RED4ext::v1::PluginInfo* info)
 {
     info->name = L"DriveNoCollision";
     info->author = L"DriveNoCollision contributors";
-    info->version = RED4EXT_V1_SEMVER(0, 29, 0);
+    info->version = RED4EXT_V1_SEMVER(0, 32, 0);
     info->runtime = RED4EXT_V1_RUNTIME_VERSION_2_50;
     info->sdk = RED4EXT_V1_SDK_VERSION_CURRENT;
 }

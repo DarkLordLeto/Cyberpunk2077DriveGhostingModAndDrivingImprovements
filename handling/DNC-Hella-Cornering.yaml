@@ -1,0 +1,19 @@
+DNC.HellaFront:
+  $base: Vehicle.VehicleWheelPreset_Archer_Players_Front
+  frictionMulLateral: 0.94
+
+DNC.HellaRear:
+  $base: Vehicle.VehicleWheelPreset_Archer_Players_Rear
+  frictionMulLateral: 0.95
+
+DNC.HellaWheels:
+  $base: Vehicle.VehicleDriveModelData_Archer_Players_inline0
+  frontPreset: DNC.HellaFront
+  backPreset: DNC.HellaRear
+
+DNC.HellaDrive:
+  $base: Vehicle.VehicleDriveModelData_Archer_Players
+  wheelSetup: DNC.HellaWheels
+
+Vehicle.v_standard2_archer_hella_player:
+  vehDriveModelData: DNC.HellaDrive

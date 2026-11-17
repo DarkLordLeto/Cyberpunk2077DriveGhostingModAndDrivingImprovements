@@ -1,7 +1,9 @@
 #include "FadeContacts.hpp"
 #include "GhostVisual.hpp"
+#include "CarQuery.hpp"
 #include "RenderDispatch.hpp"
 #include "TryQueue.hpp"
+#include "TrySnapshot.hpp"
 #include "VerifiedBuild.hpp"
 #include <array>
 #include <chrono>
@@ -17,7 +19,17 @@ struct Target {
     std::chrono::steady_clock::time_point retryAt{};
 };
 std::array<Target,8> targets{};
+struct OverlapLease { uint64_t mount{}, expires{}; Dnc::VehicleIdentity driver{},traffic{}; };
+Dnc::TrySnapshot<std::array<OverlapLease,8>> overlaps(std::array<OverlapLease,8>{});
 
+}
+bool HasGhostOverlap(uint64_t mount,Dnc::VehicleIdentity driver,Dnc::VehicleIdentity traffic,uint64_t now) {
+    bool found=false;
+    overlaps.Read([&](const auto& leases) {
+        for(const auto& lease:leases)
+            if(lease.mount==mount && lease.driver==driver && lease.traffic==traffic && now<lease.expires) found=true;
+    });
+    return found;
 }
 void QueueFadeContact(FadeContact contact) {contacts.Push(contact);}
 void UpdateFadeContacts(uint64_t mount,uint64_t now,RED4ext::v1::PluginHandle h,const RED4ext::v1::Sdk* sdk) {
@@ -56,6 +68,16 @@ void UpdateFadeContacts(uint64_t mount,uint64_t now,RED4ext::v1::PluginHandle h,
         }
         if(!overlapping && now-hit.at>300) retire(target);
     }
+    std::array<OverlapLease,8> leases{};
+    for(size_t i=0;i<targets.size();++i) {
+        const auto& t=targets[i];
+        if(t.active && t.overlapping && t.lastValid==now) {
+            leases[i]={mount,now+100,t.contact.driver,t.contact.traffic};
+            // Keep wheel and suspension queries passing through for the whole overlap.
+            CarQuery::Ghost(mount,t.contact.traffic.proxy,400);
+        }
+    }
+    overlaps.Publish(leases);
 }
 void InspectFadeTarget(Dnc::VehicleIdentity id,RED4ext::ent::Entity* entity,RED4ext::v1::PluginHandle h,const RED4ext::v1::Sdk* sdk) {
     Target* found=nullptr;

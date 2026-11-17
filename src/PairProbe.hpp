@@ -11,3 +11,7 @@ void ObserveDriver(uint64_t entity,uint32_t proxy,int verifiedDriver,int owned,b
 void ObserveNearbyVehicle(uint64_t entity,uint32_t proxy,int owned,int traffic,int driver);
 
 void PublishNearbyObservations();
+void ObserveVehicleParts(RED4ext::IScriptable* object,uint32_t proxy);
+
+// While the driven vehicle is stationary the game-thread refresh work runs at a lower rate.
+void SetParkedMode(bool parked);
